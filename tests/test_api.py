@@ -1,5 +1,8 @@
 """API 端到端测试：每个用例使用独立的临时 SQLite 数据库。"""
+import os
+import sqlite3
 import threading
+from fractions import Fraction
 from uuid import uuid4
 
 import pytest
@@ -2753,3 +2756,237 @@ def test_concurrent_counts_serialize_and_stale_preview_conflicts(client):
     assert final_balance == success_body["items"][0]["counted"]
     assert client.get(f"/inventory-counts/{success_body['id']}").json() == success_body
     assert client.get("/inventory-counts/2").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 深层嵌套回归：合法配方连续嵌套 1200 层时，占比追溯与制备核算不得触发
+# RecursionError（500）。链路直接写入数据库构造（避开逐层 HTTP 建链的耗时），
+# 断言全部走 HTTP 接口。
+# ---------------------------------------------------------------------------
+
+DEEP_CHAIN_DEPTH = 1200
+
+
+@pytest.fixture()
+def deep_chain(client):
+    """构造 1200 层连续嵌套：P1 = 1×S1 + 1×S2，P_i = 1×P_{i-1} + 1×S_{i%2}。
+
+    返回 (s1, s2, 最深批次 id)；最深批次的单位消耗为 S1×601 + S2×600。
+    """
+    conn = sqlite3.connect(os.environ["DATABASE_PATH"])
+    try:
+        cur = conn.execute("INSERT INTO batches (name, kind) VALUES ('DS1', 'sample')")
+        s1 = cur.lastrowid
+        cur = conn.execute("INSERT INTO batches (name, kind) VALUES ('DS2', 'sample')")
+        s2 = cur.lastrowid
+        prev = None
+        for i in range(1, DEEP_CHAIN_DEPTH + 1):
+            cur = conn.execute(
+                "INSERT INTO batches (name, kind) VALUES (?, 'pool')", (f"DP{i}",)
+            )
+            pool_id = cur.lastrowid
+            ingredients = (
+                [(s1, 1), (s2, 1)] if i == 1 else [(prev, 1), (s1 if i % 2 == 0 else s2, 1)]
+            )
+            conn.executemany(
+                "INSERT INTO pool_recipes (pool_id, ingredient_id, portions)"
+                " VALUES (?, ?, ?)",
+                [(pool_id, ingredient, portions) for ingredient, portions in ingredients],
+            )
+            prev = pool_id
+        conn.commit()
+    finally:
+        conn.close()
+    return s1, s2, prev
+
+
+def test_deep_chain_composition_exact_fractions(client, deep_chain):
+    """1200 层嵌套的占比查询：精确分数结果与闭式解一致，不得 500。"""
+    s1, s2, deep = deep_chain
+    r = client.get(f"/batches/{deep}/composition")
+    assert r.status_code == 200, r.text
+    fracs = fractions_of(client, deep)
+    # P_i 中 S1 的占比 a_i 满足 a_i = a_{i-1}/2 + [i 偶]/2，a_1 = 1/2，
+    # 闭式解 a_1200 = (2^1201 + 1) / (3·2^1200)，S2 为 1 − a_1200（均已最简）
+    assert fracs == {
+        s1: ((2**1201 + 1) // 3, 2**1200),
+        s2: ((2**1200 - 1) // 3, 2**1200),
+    }
+
+
+def test_deep_chain_readonly_endpoints(client, deep_chain):
+    """1200 层嵌套下，规划、诊断、配方预演、排产预演与禁配影响预演均正常。"""
+    s1, s2, deep = deep_chain
+
+    # 配方预演：原配方与预演配方各自独立展开（最深批次的下游只有自身）
+    r = client.post(f"/batches/{deep}/recipe-preview", json={
+        "recipe": [{"batch_id": s1, "portions": 2}, {"batch_id": s2, "portions": 1}],
+    })
+    assert r.status_code == 200, r.text
+    affected = r.json()["affected_batches"]
+    assert [b["batch_id"] for b in affected] == [deep]
+    preview = {c["sample_id"]: (c["preview"]["numerator"], c["preview"]["denominator"])
+               for c in affected[0]["components"]}
+    assert preview == {s1: (2, 3), s2: (1, 3)}
+    # 预演只读：原占比保持闭式解不变
+    assert fractions_of(client, deep)[s1] == ((2**1201 + 1) // 3, 2**1200)
+
+    # 目标占比规划：深链中 S1 占比 a，与纯 S2 各 1 份混合后恰为 a/2
+    r = plan(client, deep, s2, s1, (2**1201 + 1) // 3, 2**1201, 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["total_portions"] == 2
+
+    # 份数诊断：实测即真实组成时无误判解（深链各原料展开均正常）
+    a_num = (2**1201 + 1) // 3
+    r = client.post(f"/batches/{deep}/portion-diagnosis", json={
+        "measurements": [
+            {"sample_id": s1, "numerator": a_num, "denominator": 2**1200},
+            {"sample_id": s2, "numerator": 2**1200 - a_num, "denominator": 2**1200},
+        ],
+        "max_portions": 10,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "batch_id": deep,
+        "batch_name": f"DP{DEEP_CHAIN_DEPTH}",
+        "solutions": [],
+        "undetermined": [],
+    }
+
+    # 禁配补录影响预演：两样本在每一层汇合，仅 P1 为首次合流
+    r = client.post("/exclusion-rules/impact-preview",
+                    json={"sample_a_id": s1, "sample_b_id": s2})
+    assert r.status_code == 200, r.text
+    affected = r.json()["affected_batches"]
+    assert len(affected) == DEEP_CHAIN_DEPTH
+    first = s2 + 1  # P1 的批次 id
+    assert [b["batch_id"] for b in affected] == list(range(first, deep + 1))
+    assert [b["is_first_confluence"] for b in affected] == [True] + [False] * (
+        DEEP_CHAIN_DEPTH - 1
+    )
+    assert all(b["first_confluence_batch_ids"] == [first] for b in affected)
+
+    # 只读排产预演：库存不足选空集，补足后选唯一订单，且不扣库存
+    r = client.post("/preparation-jobs/selection-preview",
+                    json={"items": [{"batch_id": deep, "times": 1}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["selected_positions"] == []
+    add_inventory(client, s1, 601)
+    add_inventory(client, s2, 600)
+    r = client.post("/preparation-jobs/selection-preview",
+                    json={"items": [{"batch_id": deep, "times": 1}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["selected_positions"] == [1]
+    assert get_inventory(client, s1).json()["balance"] == 601
+
+
+def test_deep_chain_single_preparation_and_rollback(client, deep_chain):
+    """1200 层嵌套的单批制备：逐层整数乘算；不足与封存均 409 且整体回滚。"""
+    s1, s2, deep = deep_chain
+    add_inventory(client, s1, 601)
+    add_inventory(client, s2, 600)
+
+    r = client.post(f"/batches/{deep}/preparations", json={"times": 1})
+    assert r.status_code == 201, r.text
+    assert {c["sample_id"]: c["portions"] for c in r.json()["consumptions"]} == {
+        s1: 601,
+        s2: 600,
+    }
+    assert get_inventory(client, s1).json()["balance"] == 0
+    assert get_inventory(client, s2).json()["balance"] == 0
+
+    # 库存不足：409 且整体回滚，余额不变、不留制备记录
+    r = client.post(f"/batches/{deep}/preparations", json={"times": 1})
+    assert r.status_code == 409, r.text
+    assert get_inventory(client, s1).json()["balance"] == 0
+    assert client.get("/preparations/2").status_code == 404
+
+    # 上游样本封存：409 且整次请求不扣库存、不写记录；解除后可再次制备
+    r = client.post(f"/batches/{s1}/seal", json={"reason": "深链封存回归"})
+    assert r.status_code == 200, r.text
+    add_inventory(client, s1, 601)
+    add_inventory(client, s2, 600)
+    r = client.post(f"/batches/{deep}/preparations", json={"times": 1})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["sealed_samples"][0]["sample_id"] == s1
+    assert get_inventory(client, s1).json()["balance"] == 601
+    assert client.get("/preparations/2").status_code == 404
+    r = client.post(f"/batches/{s1}/unseal", json={"reason": "解除"})
+    assert r.status_code == 200, r.text
+    r = client.post(f"/batches/{deep}/preparations", json={"times": 1})
+    assert r.status_code == 201, r.text
+
+
+def test_deep_chain_preparation_job_and_rollback(client, deep_chain):
+    """1200 层嵌套的整单制备：按样本汇总核算；不足 409 且整单回滚。"""
+    s1, s2, deep = deep_chain
+    add_inventory(client, s1, 1202)
+    add_inventory(client, s2, 1200)
+
+    r = client.post("/preparation-jobs", json={
+        "items": [{"batch_id": deep, "times": 1}, {"batch_id": deep, "times": 1}],
+    })
+    assert r.status_code == 201, r.text
+    assert {c["sample_id"]: c["portions"] for c in r.json()["consumptions"]} == {
+        s1: 1202,
+        s2: 1200,
+    }
+    assert get_inventory(client, s1).json()["balance"] == 0
+
+    # 汇总需求超过余额：409 且整单回滚，余额不变、整单不留记录
+    add_inventory(client, s1, 1202)
+    add_inventory(client, s2, 1199)
+    r = client.post("/preparation-jobs", json={
+        "items": [{"batch_id": deep, "times": 1}, {"batch_id": deep, "times": 1}],
+    })
+    assert r.status_code == 409, r.text
+    shortages = {s["sample_id"]: s for s in r.json()["detail"]["shortages"]}
+    assert shortages[s2]["required"] == 1200
+    assert shortages[s2]["available"] == 1199
+    assert get_inventory(client, s1).json()["balance"] == 1202
+    assert client.get("/preparations/3").status_code == 404
+
+
+def test_post_order_eval_expands_shared_upstream_once():
+    """依赖后序求值：多路径汇合的共享上游只展开一次，各路径贡献分别累加。"""
+    from app.service import _post_order_eval
+
+    # 菱形汇合：P1 = S1 + S2，P2 = P1 + S1，P3 = P1 + S2，P4 = P2 + P3
+    kinds = {1: "sample", 2: "sample", 3: "pool", 4: "pool", 5: "pool", 6: "pool"}
+    recipes = {
+        3: [(1, 1), (2, 1)],
+        4: [(3, 1), (1, 1)],
+        5: [(3, 1), (2, 1)],
+        6: [(4, 1), (5, 1)],
+    }
+    evaluations: list[int] = []
+
+    def combine(node, items):
+        evaluations.append(node)
+        total = sum(portions for _, portions in items)
+        result: dict[int, Fraction] = {}
+        for ingredient_id, portions in items:
+            share = Fraction(portions, total)
+            for sample_id, frac in memo[ingredient_id].items():
+                result[sample_id] = result.get(sample_id, Fraction(0)) + share * frac
+        return result
+
+    memo: dict[int, dict[int, Fraction]] = {}
+    _post_order_eval(kinds, recipes, [6], memo,
+                     leaf=lambda node: {node: Fraction(1)}, combine=combine)
+    assert sorted(evaluations) == [3, 4, 5, 6]  # 每个混样批次恰好结算一次
+    assert memo[6] == {1: Fraction(1, 2), 2: Fraction(1, 2)}
+
+
+def test_post_order_eval_deep_chain_without_recursion():
+    """依赖后序求值：10 万层嵌套不触发解释器递归上限（纯内存，不经 HTTP）。"""
+    from app.service import _post_order_eval
+
+    depth = 100_000
+    kinds = {0: "sample", **{i: "pool" for i in range(1, depth + 1)}}
+    recipes = {i: [(i - 1, 1)] for i in range(1, depth + 1)}
+    memo: dict[int, int] = {}
+    _post_order_eval(kinds, recipes, [depth], memo,
+                     leaf=lambda node: 1,
+                     combine=lambda _node, items: memo[items[0][0]] + 1)
+    assert memo[depth] == depth + 1
