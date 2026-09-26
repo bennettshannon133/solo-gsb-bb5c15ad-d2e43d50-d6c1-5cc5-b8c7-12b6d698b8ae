@@ -2753,3 +2753,100 @@ def test_concurrent_counts_serialize_and_stale_preview_conflicts(client):
     assert final_balance == success_body["items"][0]["counted"]
     assert client.get(f"/inventory-counts/{success_body['id']}").json() == success_body
     assert client.get("/inventory-counts/2").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# 深层嵌套：合法配方连续嵌套 1200 层（远超解释器默认递归上限 1000）
+# 配方图展开为非递归的依赖后序计算，占比/制备/规划/诊断/预演均不得触发
+# RecursionError（不提高递归上限、不限制合法深度）
+# --------------------------------------------------------------------------- #
+
+
+def test_deep_nested_chain_1200_layers(client):
+    depth = 1200
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    # P1 = 1×S1 + 1×S2；P_k = 1×P_{k-1} + 1×S1（k = 2..1200）
+    pools = {1: make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])}
+    for k in range(2, depth + 1):
+        pools[k] = make_pool(client, f"P{k}", [
+            {"batch_id": pools[k - 1], "portions": 1},
+            {"batch_id": s1, "portions": 1},
+        ])
+    deep = pools[depth]
+
+    # 占比查询：S2 = (1/2)^1200，S1 = 1 - (1/2)^1200（精确分数，约分后的分子/分母）
+    den = 2 ** depth
+    assert fractions_of(client, deep) == {s1: (den - 1, den), s2: (1, den)}
+
+    # 单批制备：每次消耗 1200×S1 + 1×S2（整数乘算、多路径合并）
+    add_inventory(client, s1, depth * 3)
+    add_inventory(client, s2, 3)
+    r = prepare(client, deep, 2)
+    assert r.status_code == 201, r.text
+    assert r.json()["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": depth * 2},
+        {"sample_id": s2, "sample_name": "S2", "portions": 2},
+    ]
+
+    # 整单制备：深层批次与原始样本合并核算（S2 先补足 1 份）
+    add_inventory(client, s2, 1)
+    r = prepare_job(client, [{"batch_id": deep, "times": 1}, {"batch_id": s2, "times": 1}])
+    assert r.status_code == 201, r.text
+    assert r.json()["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": depth},
+        {"sample_id": s2, "sample_name": "S2", "portions": 2},
+    ]
+
+    # 库存不足：整单 409 且整单回滚（余额不变、不留制备记录）
+    before = get_inventory(client, s1).json()
+    r = prepare_job(client, [{"batch_id": deep, "times": 1}])
+    assert r.status_code == 409
+    assert r.json()["detail"]["shortages"][0]["sample_id"] == s1
+    assert get_inventory(client, s1).json() == before
+
+    # 目标占比规划：深层批次（S1 占 1-2^-1200）与 S2（占 0），目标 1/2
+    # → 最小整数解 x:y = 2^1199 : (2^1199 - 1)
+    r = plan(client, deep, s2, s1, 1, 2, 2 ** depth)
+    assert r.status_code == 200, r.text
+    assert r.json()["recipe"] == [
+        {"batch_id": deep, "portions": 2 ** (depth - 1)},
+        {"batch_id": s2, "portions": 2 ** (depth - 1) - 1},
+    ]
+
+    # 份数诊断：实测对应 2×P1199 + 1×S1（S1 = 1 - 1/(3·2^1198)）→ 唯一解 P1199 份数 1→2
+    d = 3 * 2 ** (depth - 2)
+    r = diagnose(client, deep, measured((s1, d - 1, d), (s2, 1, d)), 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["solutions"] == [{
+        "ingredient_batch_id": pools[depth - 1],
+        "ingredient_name": f"P{depth - 1}",
+        "original_portions": 1,
+        "corrected_portions": 2,
+    }]
+
+    # 配方预演：P600 预演替换为纯 S2 → 目标及下游共 601 个批次重算，
+    # 深层占比变为 1 - 2^-600；只读，数据库中的占比保持原样
+    before_comp = fractions_of(client, deep)
+    r = preview(client, pools[600], [{"batch_id": s2, "portions": 1}])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["affected_batches"]) == depth - 600 + 1
+    top = next(b for b in body["affected_batches"] if b["batch_id"] == deep)
+    s1_preview = next(c for c in top["components"] if c["sample_id"] == s1)["preview"]
+    assert (s1_preview["numerator"], s1_preview["denominator"]) == (2 ** 600 - 1, 2 ** 600)
+    assert fractions_of(client, deep) == before_comp
+
+    # 只读排产预演：深层批次候选订单按同一库存快照展开需求（此时库存已耗尽，选空集）
+    r = selection_preview(client, [{"batch_id": deep, "times": 1}])
+    assert r.status_code == 200, r.text
+    assert r.json()["selected_positions"] == []
+
+    # 禁配补录影响预演：1200 个混样批次全部同时含 S1、S2，首次合流均为 P1
+    r = impact_preview(client, s1, s2)
+    assert r.status_code == 200, r.text
+    affected = r.json()["affected_batches"]
+    assert len(affected) == depth
+    assert affected[0]["is_first_confluence"] is True
+    assert all(b["first_confluence_batch_ids"] == [pools[1]] for b in affected)

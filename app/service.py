@@ -2,11 +2,15 @@
 
 全程使用 fractions.Fraction 做精确有理数运算，避免浮点误差；
 Fraction 会自动约分，分子/分母即为最简形式。
+
+配方图展开统一采用非递归的依赖后序计算（显式栈替代递归调用），
+合法配方任意嵌套深度都不会触发解释器的递归上限。
 """
 from __future__ import annotations
 
 import math
 import sqlite3
+from collections.abc import Container, Iterator
 from fractions import Fraction
 
 Composition = dict[int, Fraction]  # {原始样本 id: 占比}
@@ -29,27 +33,64 @@ def _load_graph(conn: sqlite3.Connection) -> tuple[dict[int, str], Recipes]:
     return kinds, recipes
 
 
+def _dependency_post_order(
+    recipes: Recipes, root: int, done: Container[int]
+) -> Iterator[int]:
+    """按依赖后序（全部直接原料先于引用者）产出 root 可达且未完成的批次 id。
+
+    非递归实现：显式栈替代递归调用，嵌套深度只受内存限制，不受解释器
+    递归上限约束。约定：
+
+    - done 中的节点视为已完成，不再展开也不产出——同一计算内共享的上游
+      只展开一次；
+    - 调用方按产出顺序依次完成各节点（把结果写入作为 done 的缓存）后再
+      推进遍历，保证任何节点被产出时其全部直接原料都已在缓存中；
+    - 配方图是有向无环图（新批次只能引用更早创建的批次），遍历必然终止。
+    """
+    stack = [root]
+    while stack:
+        node = stack[-1]
+        if node in done:  # 已完成（含汇合处被多条路径压栈的重复项）：跳过
+            stack.pop()
+            continue
+        pending = [
+            ingredient_id
+            for ingredient_id, _ in recipes.get(node, [])
+            if ingredient_id not in done
+        ]
+        if pending:
+            # 原料尚未全部完成：压栈先展开原料，自身留在栈上等待后序回访
+            stack.extend(pending)
+            continue
+        yield node
+        stack.pop()
+
+
 def _expand(
     kinds: dict[int, str],
     recipes: Recipes,
     batch_id: int,
     memo: dict[int, Composition],
 ) -> Composition:
-    """递归展开批次；memo 让多路径汇合的批次只精确计算一次。"""
-    if batch_id in memo:
-        return memo[batch_id]
-    if kinds[batch_id] == "sample":
-        memo[batch_id] = {batch_id: Fraction(1)}
-        return memo[batch_id]
-    items = recipes.get(batch_id, [])
-    total = sum(portions for _, portions in items)
-    result: Composition = {}
-    for ingredient_id, portions in items:
-        share = Fraction(portions, total)
-        for sample_id, frac in _expand(kinds, recipes, ingredient_id, memo).items():
-            result[sample_id] = result.get(sample_id, Fraction(0)) + share * frac
-    memo[batch_id] = result
-    return result
+    """非递归展开批次；memo 让多路径汇合的批次只精确计算一次。
+
+    按依赖后序逐个计算：每个批次的全部直接原料都先它进入 memo，本层再按
+    “投入份数 / 该层总份数”把各原料的展开结果汇总进来——同一上游只展开
+    一次，但同一原始样本经各条路径到达的贡献按各自份额分别累加。
+    """
+    for node in _dependency_post_order(recipes, batch_id, memo):
+        if kinds[node] == "sample":
+            memo[node] = {node: Fraction(1)}
+            continue
+        items = recipes.get(node, [])
+        total = sum(portions for _, portions in items)
+        result: Composition = {}
+        for ingredient_id, portions in items:
+            share = Fraction(portions, total)
+            for sample_id, frac in memo[ingredient_id].items():
+                result[sample_id] = result.get(sample_id, Fraction(0)) + share * frac
+        memo[node] = result
+    return memo[batch_id]
 
 
 def reachable_samples(conn: sqlite3.Connection, ingredient_ids: list[int]) -> set[int]:
@@ -80,11 +121,12 @@ def reachable_samples(conn: sqlite3.Connection, ingredient_ids: list[int]) -> se
 
 
 def batch_composition(conn: sqlite3.Connection, batch_id: int) -> Composition:
-    """递归展开批次，返回 {原始样本 id: 占比}。
+    """沿配方图展开批次，返回 {原始样本 id: 占比}。
 
     - 每一层按“投入份数 / 该层总份数”分摊占比；
     - 同一原始样本经多条路径到达时，占比相加合并；
-    - 新批次只能引用已创建的批次，引用关系天然是有向无环图，递归必然终止。
+    - 新批次只能引用已创建的批次，引用关系天然是有向无环图；
+      非递归的依赖后序计算对任意合法嵌套深度都必然终止。
     """
     kinds, recipes = _load_graph(conn)
     return _expand(kinds, recipes, batch_id, {})
@@ -99,7 +141,8 @@ def exclusion_impact_preview(
     - 受影响批次 = 沿配方图可达原始样本中同时含两样本的混样批次，按 id 升序、各一次；
     - 首次合流 = 自身同时含两样本、但每个直接原料都不同时含两样本的批次；
     - 可追溯首次合流：沿配方边向上追溯，自身为首次合流时含自身，否则为各原料
-      追溯结果的并集；嵌套与多路径汇合经 memo + 集合并去重，不漏报不重复。
+      追溯结果的并集；嵌套与多路径汇合经 memo + 集合并去重，不漏报不重复；
+    - 可达性与追溯均为非递归的依赖后序计算，任意嵌套深度都不受递归上限约束。
     全程只读：不登记规则、不改任何配方。
     """
     kinds, recipes = _load_graph(conn)
@@ -110,16 +153,15 @@ def exclusion_impact_preview(
 
     def reachable(batch_id: int) -> frozenset[int]:
         """沿配方 DAG 收集批次可达的全部原始样本；多路径汇合只展开一次。"""
-        if batch_id in reach_memo:
-            return reach_memo[batch_id]
-        if kinds[batch_id] == "sample":
-            result: frozenset[int] = frozenset({batch_id})
-        else:
-            result = frozenset().union(
-                *(reachable(ingredient_id) for ingredient_id, _ in recipes.get(batch_id, []))
-            )
-        reach_memo[batch_id] = result
-        return result
+        for node in _dependency_post_order(recipes, batch_id, reach_memo):
+            if kinds[node] == "sample":
+                reach_memo[node] = frozenset({node})
+            else:
+                reach_memo[node] = frozenset().union(
+                    *(reach_memo[ingredient_id]
+                      for ingredient_id, _ in recipes.get(node, []))
+                )
+        return reach_memo[batch_id]
 
     affected = [
         batch_id
@@ -142,22 +184,21 @@ def exclusion_impact_preview(
     def trace_first(batch_id: int) -> frozenset[int]:
         """沿配方边向上追溯全部首次合流批次 id。
 
-        非受影响原料（不同时含两样本，含原始样本自身）追溯结果为空：首次合流
-        只可能出现在“同时含两样本”的子 DAG 上。
+        非受影响节点（不同时含两样本，含原始样本自身）追溯结果为空：首次合流
+        只可能出现在“同时含两样本”的子 DAG 上（可达集是原料可达集的并集，
+        不含两样本的批次不可能通向首次合流）。
         """
-        if batch_id in trace_memo:
-            return trace_memo[batch_id]
-        # 不含两样本的批次不可能通向首次合流（可达集是原料可达集的并集）
-        if not pair <= reachable(batch_id):
-            result = frozenset()
-        elif first_confluence.get(batch_id):
-            result = frozenset({batch_id})
-        else:
-            result = frozenset().union(
-                *(trace_first(ingredient_id) for ingredient_id in ingredient_ids(batch_id))
-            )
-        trace_memo[batch_id] = result
-        return result
+        for node in _dependency_post_order(recipes, batch_id, trace_memo):
+            if not pair <= reachable(node):
+                trace_memo[node] = frozenset()
+            elif first_confluence.get(node):
+                trace_memo[node] = frozenset({node})
+            else:
+                trace_memo[node] = frozenset().union(
+                    *(trace_memo[ingredient_id]
+                      for ingredient_id in ingredient_ids(node))
+                )
+        return trace_memo[batch_id]
 
     return low_id, high_id, [
         (batch_id, first_confluence[batch_id], sorted(trace_first(batch_id)))
@@ -192,7 +233,9 @@ def recipe_preview(
     """在内存中把 batch_id 的配方替换为 new_recipe，评估影响，不修改数据库。
 
     返回 {受影响批次 id: (原占比, 预演占比)}；新配方只允许引用比目标批次
-    更早创建的批次（由调用方校验），替换后引用图仍是无环图，递归必然终止。
+    更早创建的批次（由调用方校验），替换后引用图仍是无环图，遍历必然终止。
+    原配方与预演配方各自使用独立的计算缓存（original_memo / preview_memo），
+    互不复用展开结果。
     """
     kinds, recipes = _load_graph(conn)
     affected = downstream_batches(recipes, batch_id)
@@ -379,19 +422,20 @@ def _unit_needs(
     - 混样制备一次按配方消耗各直接原料“份数”次，各原料的单位消耗按份数
       逐层相乘；同一原始样本经多条配方路径到达时需求相加合并；
     - 配方份数与制备次数都是正整数，逐层乘算、合并的结果恒为整数，
-      无需分数运算；memo 让多路径汇合的批次只计算一次。
+      无需分数运算；
+    - 非递归的依赖后序计算：原料先于引用者完成，memo 让多路径汇合的批次
+      只计算一次，嵌套深度不受递归上限约束。
     """
-    if batch_id in memo:
-        return memo[batch_id]
-    if kinds[batch_id] == "sample":
-        memo[batch_id] = {batch_id: 1}
-        return memo[batch_id]
-    needs: dict[int, int] = {}
-    for ingredient_id, portions in recipes.get(batch_id, []):
-        for sample_id, unit in _unit_needs(kinds, recipes, ingredient_id, memo).items():
-            needs[sample_id] = needs.get(sample_id, 0) + portions * unit
-    memo[batch_id] = needs
-    return needs
+    for node in _dependency_post_order(recipes, batch_id, memo):
+        if kinds[node] == "sample":
+            memo[node] = {node: 1}
+            continue
+        needs: dict[int, int] = {}
+        for ingredient_id, portions in recipes.get(node, []):
+            for sample_id, unit in memo[ingredient_id].items():
+                needs[sample_id] = needs.get(sample_id, 0) + portions * unit
+        memo[node] = needs
+    return memo[batch_id]
 
 
 def preparation_requirements(
